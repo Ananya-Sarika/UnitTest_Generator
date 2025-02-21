@@ -1,0 +1,1625 @@
+function_code,test_code
+"func BuildURLQuery(req *http.Request, params map[string]string) url.Values {
+	query := req.URL.Query()
+	for key, value := range params {
+		query.Add(key, value)
+	}
+
+	return query
+
+}","func TestBuildURLQuery(t *testing.T) {
+	req, _ := http.NewRequest(""GET"", ""https://test.com"", nil)
+	params := map[string]string{
+		""key1"": ""value1"",
+		""key2"": ""value2"",
+	}
+
+	query := BuildURLQuery(req, params)
+	expected := url.Values{
+		""key1"": {""value1""},
+		""key2"": {""value2""},
+	}
+
+	assert.Equal(t, expected, query)
+}"
+"func NewManagerService(r interfaces.ManagerRepository, p mqint.Publisher, t opentelemetry.OtelTracer, j jiraint.JiraService) interfaces.ManagerService {
+	return provisioningmanager.New(r, p, t, j)
+}","func TestNewManagerService(t *testing.T) {
+	svc := NewManagerService(nil, nil, nil, nil)
+	assert.NotNil(t, svc)
+}"
+"func (d *dispatcher) CallMethodByName(ctx context.Context, name string, req provent.Resource) error {
+	ctx, span := tracer.Start(ctx, ""CallMethodByName"")
+	defer span.End()
+	method := reflect.ValueOf(d).MethodByName(name)
+	if !method.IsValid() {
+		logger.L.ErrorCtx(ctx, ""unknown method invoked"")
+		return errors.New(""unknown dispatcher"")
+	}
+	result := method.Call([]reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(req)})
+	if len(result) == 0 {
+		logger.L.WarnCtx(ctx, ""the provisioner didnt return any value"", zap.String(""provisioner"", name))
+		return nil
+	}
+	if res := result[0].Interface(); res != nil {
+		if err, ok := res.(error); ok && err != nil {
+			return err
+		} else {
+			logger.L.WarnCtx(ctx, ""the returned value is expected to be an error"", zap.Any(""returnValue"", res))
+		}
+	}
+	return nil
+}","func TestCallMethodByName(t *testing.T) {
+	originalStartFn := mockstartFn
+	defer func() { mockstartFn = originalStartFn }()
+
+	mockTracer := opentelemetry.MockTracer{}
+	mockstartFn = mockStart
+
+	mockStart = func(m opentelemetry.MockTracer, ctx context.Context, spanName string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+		return ctx, trace.SpanFromContext(ctx)
+	}
+
+	originalTracer := tracer
+	defer func() { tracer = originalTracer }()
+	tracer = mockTracer
+
+	mockPublisher := publishermock.MockPublisher{}
+	InitializePublishSvc(mockPublisher)
+
+	dispatcher := &dispatcher{}
+
+	err := dispatcher.CallMethodByName(context.TODO(), ""Sample"", provent.Resource{})
+	assert.NoError(t, err)
+	err = dispatcher.CallMethodByName(context.TODO(), ""NonExistentMethod"", provent.Resource{})
+	assert.EqualError(t, err, ""unknown dispatcher"")
+}"
+"func (svc managerSvc) FeedbackHandler(ctx context.Context, body []byte) error {
+	ctx, span := svc.tracer.Start(ctx, ""FeedbackHandler"")
+	defer span.End()
+	logger.L.InfoCtx(ctx, ""feedback handler invoked..."")
+	var request provent.Resource
+	if err := json.Unmarshal(body, &request); err != nil {
+		logger.L.ErrorCtx(ctx, ""couldnt read the msg"", zap.Error(err))
+		return err
+	}
+	ctx = context.WithValue(ctx, logger.ResourceID, request.ID)
+	logger.L.InfoCtx(ctx, ""received updated req"", zap.Any(""req"", request))
+	if err := svc.updateRequest(ctx, request); err != nil {
+		logger.L.ErrorCtx(ctx, ""couldnt update the request"", zap.Error(err))
+		if svc.jiraSvc != nil {
+			if err = svc.jiraSvc.MarkIssueFail(ctx, request.JIRATicketID, """"); err != nil {
+				logger.L.ErrorCtx(ctx, ""failed to change the status of jira ticket"", zap.Error(err))
+			}
+		}
+		return fmt.Errorf(""%w: couldnt update the request"", err)
+	}
+	if svc.jiraSvc != nil {
+		// update jira ticket performs following operations
+		// 1) change the state of issue by posting a comment if progress state of resource is changed
+		// 2) update ticket by posting comment(request.Message)
+		if err := svc.jiraSvc.UpdateIssue(ctx, request.State, request.JIRATicketID, request.Message); err != nil {
+			logger.L.ErrorCtx(ctx, fmt.Sprintf(""failed to update jira ticket:%s of ResourceID:%s in progressState:%d"", request.JIRATicketID, request.ID, request.State), zap.Error(err))
+		}
+		logger.L.InfoCtx(ctx, ""Successfully updated the jira ticket with current status of provisioning request"")
+	}
+	return nil
+}","func TestFeedbackHandler(t *testing.T) {
+	mockRepo := mocks.MockManagerRepository{}
+	mockManagerService := mocks.MockManagerService{}
+
+	ctx := context.TODO()
+
+	t.Run(""FeedbackHandler - Success"", func(t *testing.T) {
+		request := provent.Resource{ID: ""ResourceID""}
+		body, _ := json.Marshal(request)
+
+		mockJiraSvc := mocks.MockJiraSvc{UpdateIssueFn: func(ctx context.Context, state uint, issueIdOrKey, comment string) error { return nil }}
+		svc := NewServiceFactory().WithTracer(testTracer).WithRepository(mocks.MockManagerRepository{
+			UpdateRequestFn: func(ctx context.Context, preq provent.Resource) error {
+				return nil
+			},
+		}).WithPublisher(mockManagerService).WithJiraSvc(mockJiraSvc).Finalize()
+		assert.NotNil(t, svc)
+
+		err := svc.FeedbackHandler(ctx, body)
+		assert.Nil(t, err)
+	})
+
+	t.Run(""FeedbackHandler - JSON Unmarshal Error"", func(t *testing.T) {
+		invalidBody := []byte(""invalid json"")
+
+		svc := New(mockRepo, mockManagerService, testTracer, nil).(managerSvc)
+		assert.NotNil(t, svc)
+
+		err := svc.FeedbackHandler(ctx, invalidBody)
+		assert.NotNil(t, err)
+		assert.Equal(t, ""invalid character 'i' looking for beginning of value"", err.Error())
+	})
+
+	t.Run(""FeedbackHandler - UpdateRequest Error"", func(t *testing.T) {
+		request := provent.Resource{ID: ""ResourceID""}
+		body, _ := json.Marshal(request)
+
+		mockJiraSvc := mocks.MockJiraSvc{MarkIssueFailFn: func(ctx context.Context, issueIdorKey, comment string) error { return nil }}
+		svc := NewServiceFactory().WithTracer(testTracer).WithRepository(mocks.MockManagerRepository{
+			UpdateRequestFn: func(ctx context.Context, preq provent.Resource) error {
+				return errors.New(""update request error"")
+			},
+		}).WithPublisher(mockManagerService).WithJiraSvc(mockJiraSvc).Finalize()
+		assert.NotNil(t, svc)
+
+		err := svc.FeedbackHandler(ctx, body)
+		assert.NotNil(t, err)
+		assert.Contains(t, err.Error(), ""couldnt update the request"")
+	})
+
+	t.Run(""FeedbackHandler - UpdateRequest Error & MarkIssueFails"", func(t *testing.T) {
+		request := provent.Resource{ID: ""ResourceID""}
+		body, _ := json.Marshal(request)
+
+		mockJiraSvc := mocks.MockJiraSvc{MarkIssueFailFn: func(ctx context.Context, issueIdorKey, comment string) error { return errors.New(""some error"") }}
+		svc := NewServiceFactory().WithTracer(testTracer).WithRepository(mocks.MockManagerRepository{
+			UpdateRequestFn: func(ctx context.Context, preq provent.Resource) error {
+				return errors.New(""update request error"")
+			},
+		}).WithPublisher(mockManagerService).WithJiraSvc(mockJiraSvc).Finalize()
+		assert.NotNil(t, svc)
+
+		err := svc.FeedbackHandler(ctx, body)
+		assert.NotNil(t, err)
+		assert.Contains(t, err.Error(), ""couldnt update the request"")
+	})
+	t.Run(""FeedbackHandler - Success but UpdateIssue fails"", func(t *testing.T) {
+		request := provent.Resource{ID: ""ResourceID""}
+		body, _ := json.Marshal(request)
+
+		mockJiraSvc := mocks.MockJiraSvc{UpdateIssueFn: func(ctx context.Context, state uint, issueIdOrKey, comment string) error {
+			return errors.New(""some error"")
+		}}
+		svc := NewServiceFactory().WithTracer(testTracer).WithRepository(mocks.MockManagerRepository{
+			UpdateRequestFn: func(ctx context.Context, preq provent.Resource) error {
+				return nil
+			},
+		}).WithPublisher(mockManagerService).WithJiraSvc(mockJiraSvc).Finalize()
+		assert.NotNil(t, svc)
+
+		err := svc.FeedbackHandler(ctx, body)
+		assert.Nil(t, err)
+	})
+}"
+"func NewAPIFactory() *APIControllerOption {
+	return &APIControllerOption{
+		controller: apiController{},
+	}
+}","func TestNewAPIFactory(t *testing.T) {
+	factory := NewAPIFactory()
+	assert.NotNil(t, factory)
+	factory.Finalize()
+	assert.NotNil(t, cntlr)
+	// however there is no svc
+	assert.Nil(t, cntlr.svc)
+	// add a livefn
+	NewAPIFactory().Finalize() // reset
+	assert.Nil(t, cntlr.liveFn)
+	NewAPIFactory().WithLiveFn(func() bool { return true }).Finalize()
+	assert.NotNil(t, cntlr.liveFn)
+	// add a readyfn
+	NewAPIFactory().Finalize() // reset
+	assert.Nil(t, cntlr.readyFn)
+	NewAPIFactory().WithReadyFn(func() bool { return true }).Finalize()
+	assert.NotNil(t, cntlr.readyFn)
+	// add provia svc
+	NewAPIFactory().Finalize() // reset
+	assert.Nil(t, cntlr.svc)
+	NewAPIFactory().WithProviaSvc(mocks.MockProviaSvc{}).Finalize()
+	assert.NotNil(t, cntlr.svc)
+	// add region svc
+	NewAPIFactory().Finalize() // reset
+	assert.Nil(t, cntlr.regionSvc)
+	NewAPIFactory().WithRegionSvc(regmock.MockRegionService{}).Finalize()
+	assert.NotNil(t, cntlr.regionSvc)
+	// add environment svc
+	NewAPIFactory().Finalize() // reset
+	assert.Nil(t, cntlr.envSvc)
+	NewAPIFactory().WithEnvironmentSvc(envmock.MockEnvironmentService{}).Finalize()
+	assert.NotNil(t, cntlr.envSvc)
+	// add all dependencies
+	NewAPIFactory().Finalize() // reset
+	assert.Nil(t, cntlr.liveFn)
+	assert.Nil(t, cntlr.readyFn)
+	assert.Nil(t, cntlr.svc)
+	assert.Nil(t, cntlr.regionSvc)
+	assert.Nil(t, cntlr.envSvc)
+	NewAPIFactory().
+		WithLiveFn(func() bool { return true }).
+		WithReadyFn(func() bool { return true }).
+		WithProviaSvc(mocks.MockProviaSvc{}).
+		WithRegionSvc(regmock.MockRegionService{}).
+		WithEnvironmentSvc(envmock.MockEnvironmentService{}).
+		Finalize()
+	assert.NotNil(t, cntlr.liveFn)
+	assert.NotNil(t, cntlr.readyFn)
+	assert.NotNil(t, cntlr.svc)
+	assert.NotNil(t, cntlr.regionSvc)
+	assert.NotNil(t, cntlr.envSvc)
+}"
+"func StartAPIServer(serverPort, metricsPort uint16, liveness controllers.LiveFunc,
+	readiness controllers.ReadyFunc) error {
+	go func() {
+		if err := startMetricsServer(metricsPort); err != nil {
+			logger.L.Error(""failed to start metrics server"", zap.Error(err))
+		}
+	}()
+
+	api.InitAPIController(liveness, readiness)
+	r := chi.NewRouter()
+	api.AddAPIHandlers(r)
+
+	if err := http.ListenAndServe(fmt.Sprintf("":%d"", serverPort), r); err != nil {
+		logger.L.Error(""failed to start http server"", zap.Error(err))
+		return err
+	}
+	return nil
+}","func TestStartAPIServer(t *testing.T) {
+	liveFn := func() bool { return true }
+	readyFn := func() bool { return true }
+
+	apiServerPort := uint16(50812)
+	metricsServerPort := uint16(50912)
+
+	t.Run(""Successful API and Metrics Server Start"", func(t *testing.T) {
+		go func() {
+			err := StartAPIServer(apiServerPort, metricsServerPort, liveFn, readyFn)
+			require.NoError(t, err)
+		}()
+
+		apiPaths := []string{""/liveness"", ""/readiness""}
+		for _, path := range apiPaths {
+			resp, err := http.Get(fmt.Sprintf(""http://localhost:%d%s"", apiServerPort, path))
+			assert.NoError(t, err)
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		}
+
+		metricsResp, err := http.Get(fmt.Sprintf(""http://localhost:%d/metrics"", metricsServerPort))
+		require.NoError(t, err)
+		defer metricsResp.Body.Close()
+		assert.Equal(t, http.StatusOK, metricsResp.StatusCode)
+	})
+
+	t.Run(""Failed to Start Server"", func(t *testing.T) {
+		listenAndServe = func(addr string, handler http.Handler) error {
+			return errors.New(""server error"")
+		}
+		err := StartAPIServer(apiServerPort, metricsServerPort, liveFn, readyFn)
+		require.Error(t, err)
+	})
+}"
+"func (m MockJiraSvc) AddIssueAttachment(ctx context.Context, attachment *entities.Attachment, issueIdOrKey string) error {
+	if m.AddIssueAttachmentFn != nil {
+		return m.AddIssueAttachmentFn(ctx, attachment, issueIdOrKey)
+	}
+	return nil
+}","func TestAddIssueAttachment(t *testing.T) {
+	t.Run(""attachment is nil"", func(t *testing.T) {
+		jiraSvc := jiraSvc{}
+		err := jiraSvc.AddIssueAttachment(ctx, nil, issueID99)
+		assert.NotNil(t, err)
+		expectedError := errAttachmentsOrKeyMissing
+		assert.EqualError(t, err, expectedError)
+	})
+	t.Run(""issueIDOrKey is missing"", func(t *testing.T) {
+		attachment := entities.Attachment{Filename: testfilePath}
+		jiraSvc := jiraSvc{}
+		err := jiraSvc.AddIssueAttachment(ctx, &attachment, """")
+		assert.NotNil(t, err)
+		expectedError := errAttachmentsOrKeyMissing
+		assert.EqualError(t, err, expectedError)
+	})
+	t.Run(""client is missing"", func(t *testing.T) {
+		attachment := entities.Attachment{Filename: testfilePath}
+		jiraSvc := jiraSvc{client: nil}
+		err := jiraSvc.AddIssueAttachment(ctx, &attachment, issueID99)
+		assert.NotNil(t, err)
+		expectedError := ""client is not initialised""
+		assert.EqualError(t, err, expectedError)
+	})
+	t.Run(""attachment filename is missing"", func(t *testing.T) {
+		body := []byte(`{""id"":""54128"", ""key"": ""MNBS-99"", ""self"":""https://localhost:9000/54128""}`)
+		response := &http.Response{StatusCode: 201}
+		mockHttpClient := mocks.MockHttpClient{
+			NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+				return &http.Request{}, nil
+			},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return response, body, nil
+			},
+			NewMultiPartRequestFn: func(ctx context.Context, method, urlStr string, body io.Reader, reqHeaders map[string]string) (*http.Request, error) {
+				return &http.Request{}, nil
+			}}
+		attachment := entities.Attachment{Filename: """"}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		err := jiraSvc.AddIssueAttachment(ctx, &attachment, issueID99)
+		assert.Nil(t, err)
+	})
+	t.Run(""attachment filename is present"", func(t *testing.T) {
+		body := []byte(`{""id"":""54128"", ""key"": ""MNBS-99"", ""self"":""https://localhost:9000/54128""}`)
+		response := &http.Response{StatusCode: 201}
+		mockHttpClient := mocks.MockHttpClient{
+			NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+				return &http.Request{}, nil
+			},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return response, body, nil
+			},
+			NewMultiPartRequestFn: func(ctx context.Context, method, urlStr string, body io.Reader, reqHeaders map[string]string) (*http.Request, error) {
+				return &http.Request{}, nil
+			}}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		newMultipartWriterFn = func(w io.Writer) (*multipart.Writer, error) {
+			return multipart.NewWriter(w), nil
+		}
+		createFormFileFn = func(w *multipart.Writer, fieldname, filename string) (io.Writer, error) {
+			return nil, nil
+		}
+		copyFn = func(dst io.Writer, src io.Reader) (int64, error) {
+			return 0, nil
+		}
+
+		openFn = func(name string) (*os.File, error) {
+			return &os.File{}, nil
+		}
+
+		attachment := entities.Attachment{Filename: testfilePath}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		jiraSvc.newMultipartWriter = newMultipartWriterFn
+		jiraSvc.createFormFile = createFormFileFn
+		jiraSvc.copy = copyFn
+		jiraSvc.open = openFn
+		err := jiraSvc.AddIssueAttachment(ctx, &attachment, issueID99)
+		assert.Nil(t, err)
+	})
+	t.Run(""attachment fails at upload attachment"", func(t *testing.T) {
+		body := []byte(`{""id"":""54128"", ""key"": ""MNBS-99"", ""self"":""https://localhost:9000/54128""}`)
+		response := &http.Response{StatusCode: 201}
+		mockHttpClient := mocks.MockHttpClient{
+			NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+				return &http.Request{}, nil
+			},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return response, body, nil
+			},
+			NewMultiPartRequestFn: func(ctx context.Context, method, urlStr string, body io.Reader, reqHeaders map[string]string) (*http.Request, error) {
+				return &http.Request{}, nil
+			}}
+		attachment := entities.Attachment{Filename: testfilePath}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		openFn = func(name string) (*os.File, error) {
+			return &os.File{}, errors.New(errMessage)
+		}
+		jiraSvc.open = openFn
+		err := jiraSvc.AddIssueAttachment(ctx, &attachment, issueID99)
+		expectedError := ""error opening file:some error""
+		assert.NotNil(t, err)
+		assert.EqualError(t, err, expectedError)
+	})
+
+}"
+"func (d *dispatcher) ErrorHandler(ctx context.Context) error {
+	logger.L.InfoCtx(ctx, receivedReqMsg, zap.Any(""req"", d.request))
+	ctx, span := tracer.Start(ctx, ""ErrorHandler"")
+	defer span.End()
+	return d.errorHandler(ctx, provent.FailedState)
+}","func TestErrorHandler(t *testing.T) {
+	originalStartFn := mockstartFn
+	defer func() { mockstartFn = originalStartFn }()
+
+	mockTracer := opentelemetry.MockTracer{}
+	mockstartFn = mockStart
+
+	mockStart = func(m opentelemetry.MockTracer, ctx context.Context, spanName string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+		return ctx, trace.SpanFromContext(ctx)
+	}
+
+	originalTracer := tracer
+	defer func() { tracer = originalTracer }()
+
+	tracer = mockTracer
+
+	mockPublisher := publishermock.MockPublisher{}
+	InitializePublishSvc(mockPublisher)
+
+	dispatcher := &dispatcher{
+		request: &provent.Resource{
+			State: uint(provent.FailedState),
+		},
+	}
+	err := dispatcher.ErrorHandler(context.TODO())
+	assert.NoError(t, err)
+	assert.Equal(t, uint(provent.FailedState), dispatcher.request.State)
+}"
+"func Copy(dst io.Writer, src io.Reader) (int64, error) {
+	return io.Copy(dst, src)
+}","func TestCopy(t *testing.T) {
+	t.Run(allWellScenario, func(t *testing.T) {
+		src := bytes.NewBufferString(helloWorld)
+		var dst bytes.Buffer
+		n, err := Copy(&dst, src)
+		if err != nil {
+			t.Errorf(""Copy failed: %v"", err)
+		}
+		if n != int64(len(helloWorld)) {
+			t.Errorf(""Expected %d bytes copied, got %d"", len(helloWorld), n)
+		}
+		if dst.String() != helloWorld {
+			t.Errorf(""Expected 'Hello, world!', got '%s'"", dst.String())
+		}
+	})
+	t.Run(""Error From Source"", func(t *testing.T) {
+		src := &errorReader{err: errors.New(""read error"")}
+		var dst bytes.Buffer
+		_, err := Copy(&dst, src)
+		if err == nil {
+			t.Errorf(""Copy should have failed, but it didn't"")
+		}
+	})
+	t.Run(""Error From Destination"", func(t *testing.T) {
+		src := bytes.NewBufferString(helloWorld)
+		dst := &errorWriter{err: errors.New(""write error"")}
+		_, err := Copy(dst, src)
+		if err == nil {
+			t.Errorf(""Copy should have failed, but it didn't"")
+		}
+	})
+}"
+"func (db unitRepository) SaveTemplate(ctx context.Context, template entities.Template) error {
+	_, span := dbTracer.Start(ctx, ""DBSaveTemplate"")
+	defer span.End()
+	if db.conn == nil {
+		return errMissingDBConn
+	}
+	if _, err := db.conn.Exec(ctx, `
+	INSERT INTO 
+		templates
+		(
+			job_id
+			, resource_id
+			, resource_group_name
+			, tdata
+			, created_at
+		)
+		VALUES
+		(
+			$1
+			, $2
+			, $3
+			, $4
+			, NOW()
+		)		
+	`, template.JobID, template.ResourceID,
+		template.ResourceGroupName, template.Data); err != nil {
+		return fmt.Errorf(""couldnt save template: %v"", err)
+	}
+	return nil
+}","func TestSaveTemplate(t *testing.T) {
+	t.Run(""Successful SaveTemplate"", func(t *testing.T) {
+		mockRepo := mocks.MockRepository{
+			SaveTemplateFn: func(ctx context.Context, template entities.Template) error {
+				return nil
+			},
+		}
+		repo = mockRepo
+		template := entities.Template{}
+		err := saveTemplate(context.Background(), template)
+		assert.NoError(t, err)
+	})
+
+	t.Run(""Failure SaveTemplate"", func(t *testing.T) {
+		mockRepo := mocks.MockRepository{
+			SaveTemplateFn: func(ctx context.Context, template entities.Template) error {
+				return errors.New(""db error"")
+			},
+		}
+		repo = mockRepo
+		template := entities.Template{}
+		err := saveTemplate(context.Background(), template)
+		assert.EqualError(t, err, ""couldnt save template, db error: db error"")
+	})
+}"
+"func (m MockJiraSvc) UpdateIssue(ctx context.Context, state uint, issueIdOrKey string, comment string) error {
+	if m.UpdateIssueFn != nil {
+		return m.UpdateIssueFn(ctx, state, issueIdOrKey, comment)
+	}
+	return nil
+}","func TestUpdateIssue(t *testing.T) {
+	t.Run(""when state is 0"", func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, nil)
+		err := jiraSvc.UpdateIssue(ctx, 0, issueID99, """")
+		assert.NotNil(t, err)
+		expectedError := ""either not valid progress state:0 or issueId/key is missing""
+		assert.EqualError(t, err, expectedError)
+	})
+	t.Run(""when state is 13"", func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, nil)
+		err := jiraSvc.UpdateIssue(ctx, 13, issueID99, """")
+		assert.NotNil(t, err)
+		expectedError := ""issue ID/Key or comment is missing""
+		assert.EqualError(t, err, expectedError)
+	})
+	t.Run(""issueIdOrKey is missing"", func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, nil)
+		err := jiraSvc.UpdateIssue(ctx, 10, """", """")
+		assert.NotNil(t, err)
+		expectedError := ""either not valid progress state:10 or issueId/key is missing""
+		assert.EqualError(t, err, expectedError)
+	})
+	t.Run(errClientNotInitialized, func(t *testing.T) {
+		jiraSvc := jiraSvc{client: nil}
+		err := jiraSvc.UpdateIssue(ctx, 10, issueID121, """")
+		assert.NotNil(t, err)
+		expectedError := errClientNotInitialized
+		assert.EqualError(t, err, expectedError)
+	})
+	t.Run(""not in progress state - DeletedState:10"", func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 204}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), nil
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.UpdateIssue(ctx, 10, issueID121, """")
+		assert.Nil(t, err)
+	})
+	t.Run(""not in progress state - CompletedState:3"", func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 204}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), nil
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.UpdateIssue(ctx, 3, issueID121, """")
+		assert.Nil(t, err)
+	})
+	t.Run(""in progress state - ProcessingState:7"", func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 201}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), nil
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.UpdateIssue(ctx, 7, issueID121, ""Work in progress"")
+		assert.Nil(t, err)
+	})
+	t.Run(""in progress state - DeleteInProgress:11"", func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 201}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), nil
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.UpdateIssue(ctx, 11, issueID121, ""Work in progress"")
+		assert.Nil(t, err)
+	})
+}"
+"func InitTracerProvider(ctx context.Context, opts TracerOpts) (*sdktrace.TracerProvider, error) {
+	res, err := newResourcefn(ctx, opts.ServiceName, opts.Attributes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set up a trace exporter
+	traceExporter, err := newGrpcExporterfn(ctx, opts.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Register the trace exporter with a TracerProvider, using a batch
+	// span processor to aggregate spans before export.
+	batchSpanProcessor := sdktrace.NewBatchSpanProcessor(traceExporter)
+	tracerProvider := getTraceProviderFromResourceAndProcessorfn(res, batchSpanProcessor, traceExporter)
+	return tracerProvider, err
+}","func TestInitTracerProvider(t *testing.T) {
+	originalNewResource := newResourcefn
+	originalNewGrpcExporter := newGrpcExporterfn
+	originalGetTraceProvider := getTraceProviderFromResourceAndProcessorfn
+
+	defer func() {
+		newResourcefn = originalNewResource
+		newGrpcExporterfn = originalNewGrpcExporter
+		getTraceProviderFromResourceAndProcessorfn = originalGetTraceProvider
+	}()
+	
+	tests := []struct {
+		name              string
+		newResourcefn     func(ctx context.Context, serviceName string, attributes map[string]string) (*resource.Resource, error)
+		newGrpcExporterfn func(ctx context.Context, endpoint string) (*otlptrace.Exporter, error)
+		getTraceProviderFromResourceAndProcessorfn func(res *resource.Resource, bsp sdktrace.SpanProcessor, exporter *otlptrace.Exporter) *sdktrace.TracerProvider
+		opts              TracerOpts
+		expectedError     bool
+		expectedTracer    *sdktrace.TracerProvider
+	}{
+		{
+			name: ""Success - Valid Inputs"",
+			newResourcefn: func(ctx context.Context, serviceName string, attributes map[string]string) (*resource.Resource, error) {
+				return &resource.Resource{}, nil
+			},
+			newGrpcExporterfn: func(ctx context.Context, endpoint string) (*otlptrace.Exporter, error) {
+				return &otlptrace.Exporter{}, nil
+			},
+			getTraceProviderFromResourceAndProcessorfn: func(res *resource.Resource, bsp sdktrace.SpanProcessor, exporter *otlptrace.Exporter) *sdktrace.TracerProvider {
+				return &sdktrace.TracerProvider{}
+			},
+			opts: TracerOpts{
+				ServiceName: ""test-service"",
+				Attributes:  map[string]string{""key"": ""value""},
+				Endpoint:    ""http://abc.com"",
+			},
+			expectedError:  false,
+			expectedTracer: &sdktrace.TracerProvider{},
+		},
+		{
+			name: ""Failure - NewResource Error"",
+			newResourcefn: func(ctx context.Context, serviceName string, attributes map[string]string) (*resource.Resource, error) {
+				return nil, errors.New(""new resource error"")
+			},
+			newGrpcExporterfn: func(ctx context.Context, endpoint string) (*otlptrace.Exporter, error) {
+				return &otlptrace.Exporter{}, nil
+			},
+			getTraceProviderFromResourceAndProcessorfn: func(res *resource.Resource, bsp sdktrace.SpanProcessor, exporter *otlptrace.Exporter) *sdktrace.TracerProvider {
+				return &sdktrace.TracerProvider{}
+			},
+			opts: TracerOpts{
+				ServiceName: """",
+				Attributes:  nil,
+				Endpoint:    ""http://abc.com"",
+			},
+			expectedError: true,
+			expectedTracer: nil,
+		},
+		{
+			name: ""Failure - NewGrpcExporter Error"",
+			newResourcefn: func(ctx context.Context, serviceName string, attributes map[string]string) (*resource.Resource, error) {
+				return &resource.Resource{}, nil
+			},
+			newGrpcExporterfn: func(ctx context.Context, endpoint string) (*otlptrace.Exporter, error) {
+				return nil, errors.New(""grpc exporter error"")
+			},
+			getTraceProviderFromResourceAndProcessorfn: func(res *resource.Resource, bsp sdktrace.SpanProcessor, exporter *otlptrace.Exporter) *sdktrace.TracerProvider {
+				return &sdktrace.TracerProvider{}
+			},
+			opts: TracerOpts{
+				ServiceName: ""test-service"",
+				Attributes:  nil,
+				Endpoint:    ""http://abc.com"",
+			},
+			expectedError: true,
+			expectedTracer: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			newResourcefn = tc.newResourcefn
+			newGrpcExporterfn = tc.newGrpcExporterfn
+			getTraceProviderFromResourceAndProcessorfn = tc.getTraceProviderFromResourceAndProcessorfn
+
+			tracerProvider, err := InitTracerProvider(context.Background(), tc.opts)
+
+			if tc.expectedError {
+				assert.Error(t, err)
+				assert.Nil(t, tracerProvider)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedTracer, tracerProvider)
+			}
+		})
+	}
+}"
+"func (svc regionSvc) IsRegionSupported(ctx context.Context, cloud, region string) (bool, error) {
+	ctx, span := svc.tracer.Start(ctx, ""IsRegionSupported"")
+	defer span.End()
+	if svc.repo == nil {
+		return false, errors.New(""no store available"")
+	}
+	if cloud == """" || region == """" {
+		return false, errors.New(""cloud/region field is missing"")
+
+	}
+	regionsMap, err := svc.repo.FetchRegions(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	cloudRegion := fmt.Sprintf(""%s:%s"", strings.ToLower(cloud), strings.ToLower(region))
+	if _, ok := regionsMap[cloudRegion]; ok {
+		logger.L.InfoCtx(ctx, fmt.Sprintf(""%s is present in regions store"", cloudRegion))
+		return true, nil
+	}
+
+	logger.L.InfoCtx(ctx, fmt.Sprintf(""%s is not present in regions store"", cloudRegion))
+	return false, nil
+}","func TestIsRegionSupported(t *testing.T) {
+	cloudRegions := map[string]interface{}{""azure:azure-eastaisa"": """", ""azure:azure-india-central"": """"}
+	const (
+		validRegion   = ""azure-eastaisa""
+		inValidRegion = ""us-east-1""
+		cloud         = ""azure""
+	)
+	var (
+		svc       interfaces.RegionService
+		repo      interfaces.RegionRepository
+		someError = errors.New(""no store available"")
+		data      bool
+		err       error
+		ctx       context.Context = context.TODO()
+	)
+
+	//nil repo
+	svc = NewServiceFactory().WithTracer(testTracer).Finalize()
+	assert.NotNil(t, svc)
+	data, err = svc.IsRegionSupported(ctx, """", """")
+	assert.NotNil(t, err)
+	assert.Equal(t, false, data)
+	assert.EqualError(t, err, ""no store available"")
+	//Mock repo
+	repo = mocks.MockRegionRepository{FetchRegionsFn: func(ctx context.Context) (map[string]interface{}, error) {
+		return nil, someError
+	}}
+	svc = NewServiceFactory().WithRepository(repo).WithTracer(testTracer).Finalize()
+	assert.NotNil(t, svc)
+	data, err = svc.IsRegionSupported(ctx, """", """")
+	assert.Equal(t, false, data)
+	assert.NotNil(t, err)
+	assert.EqualError(t, err, ""cloud/region field is missing"")
+
+	//When FetchRegions returns error
+	repo = mocks.MockRegionRepository{FetchRegionsFn: func(ctx context.Context) (map[string]interface{}, error) {
+		return nil, someError
+	}}
+	svc = NewServiceFactory().WithRepository(repo).WithTracer(testTracer).Finalize()
+	assert.NotNil(t, svc)
+	data, err = svc.IsRegionSupported(ctx, ""azure"", ""us-west-europe"")
+	assert.Equal(t, false, data)
+	assert.NotNil(t, err)
+	assert.EqualError(t, err, ""no store available"")
+
+	//Check with valid region value
+	repo = mocks.MockRegionRepository{FetchRegionsFn: func(ctx context.Context) (map[string]interface{}, error) {
+		return cloudRegions, nil
+	}}
+	svc = NewServiceFactory().WithRepository(repo).WithTracer(testTracer).Finalize()
+	assert.NotNil(t, svc)
+	//This test is with Valid region and cloud
+	data, err = svc.IsRegionSupported(ctx, cloud, validRegion)
+	assert.Equal(t, true, data)
+	assert.Nil(t, err)
+
+	//Test with Invalid region
+	data, err = svc.IsRegionSupported(ctx, cloud, inValidRegion)
+	assert.Equal(t, false, data)
+	assert.Nil(t, err)
+
+	//Scenario: Region and cloud both are capital but region and cloud are valid
+	data, err = svc.IsRegionSupported(ctx, strings.ToUpper(cloud), strings.ToUpper(validRegion))
+	assert.Equal(t, true, data)
+	assert.Nil(t, err)
+
+	//Scenario: Region is capital but region and cloud are valid
+	data, err = svc.IsRegionSupported(ctx, cloud, strings.ToUpper(validRegion))
+	assert.Equal(t, true, data)
+	assert.Nil(t, err)
+
+	//Scenario: Cloud is capital but region and cloud are valid
+	data, err = svc.IsRegionSupported(ctx, strings.ToUpper(cloud), validRegion)
+	assert.Equal(t, true, data)
+	assert.Nil(t, err)
+
+	//Scenario: Cloud is missing but region value is present
+	data, err = svc.IsRegionSupported(ctx, """", validRegion)
+	assert.Equal(t, false, data)
+	assert.NotNil(t, err)
+	assert.EqualError(t, err, ""cloud/region field is missing"")
+
+	//Scenario: Cloud is present but region value is missing
+	data, err = svc.IsRegionSupported(ctx, strings.ToUpper(cloud), """")
+	assert.Equal(t, false, data)
+	assert.NotNil(t, err)
+	assert.EqualError(t, err, ""cloud/region field is missing"")
+
+}"
+"func InitializePublishSvc(p interfaces.Publisher) {
+	publisher = publishSvc{publisher: p}
+}","func TestInitializePublishSvc(t *testing.T) {
+	mockPublisher := mocks.MockPublisher{}
+	InitializePublishSvc(mockPublisher)
+	assert.NotNil(t, publisher, ""The publisher should be initialized"")
+	assert.Equal(t, mockPublisher, publisher.publisher, ""The publisher should be set to the mock publisher"")
+}"
+"func (c controller) GetRegionsV1(ctx context.Context, request oas.GetRegionsV1RequestObject) (oas.GetRegionsV1ResponseObject, error) {
+	region := ""WESTEUROPE""
+	return oas.GetRegionsV1200JSONResponse([]oas.RegionV1{
+		{Name: &region},
+	}), nil
+}","func TestGetRegionsV1(t *testing.T) {
+	ctx := context.Background()
+	controller := NewFactory().Finalize()
+
+	expectedResponse := oas.GetRegionsV1200JSONResponse([]oas.RegionV1{
+		{Name: new(string)},
+	})
+	*expectedResponse[0].Name = ""WESTEUROPE""
+
+	response, err := controller.GetRegionsV1(ctx, oas.GetRegionsV1RequestObject{})
+	assert.Nil(t, err)
+	assert.Equal(t, expectedResponse, response)
+}"
+"func (svc envSvc) IsEnvironmentSupported(ctx context.Context, env string) (bool, error) {
+	if svc.repo == nil {
+		return false, errors.New(""environment repo is not initialised"")
+	}
+	envMap, err := svc.repo.FetchEnvironments(ctx)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := envMap[strings.ToUpper(env)]; !ok {
+		logger.L.InfoCtx(ctx, fmt.Sprintf(""%s is not present in provia specified environment list"", env))
+		return false, nil
+	}
+	logger.L.InfoCtx(ctx, fmt.Sprintf(""%s is  present in provia specified environment list"", env))
+	return true, nil
+}","func TestIsEnvironmentSupported(t *testing.T) {
+	var (
+		repo        interfaces.EnvironmentRepository
+		svc         interfaces.EnvironmentService
+		envMap      map[string]string = map[string]string{""PROD"": ""Production"", ""DEV"": ""Development"", ""TEST"": ""Test""}
+		err         error
+		expectedErr error = errors.New(""environment repo is not initialised"")
+		data        bool
+	)
+	svc = NewServiceFactory().Finalize()
+	assert.NotNil(t, svc)
+	data, err = svc.IsEnvironmentSupported(context.Background(), """")
+	assert.Equal(t, false, data)
+	assert.NotNil(t, err)
+	assert.Error(t, expectedErr)
+
+	// Use Mock Repository with error
+	repo = mocks.MockEnvironmentRepository{FetchEnvironmentsFn: func(ctx context.Context) (map[string]string, error) {
+		return nil, errors.New(""some error"")
+	}}
+	svc = NewServiceFactory().WithRepository(repo).Finalize()
+	assert.NotNil(t, svc)
+	data, err = svc.IsEnvironmentSupported(context.Background(), """")
+	assert.NotNil(t, data)
+	assert.NotNil(t, err)
+	assert.Equal(t, false, data)
+	assert.Error(t, errors.New(""some error""))
+
+	// Use Mock Repository with correct output
+	repo = mocks.MockEnvironmentRepository{FetchEnvironmentsFn: func(ctx context.Context) (map[string]string, error) {
+		return envMap, nil
+	}}
+	svc = NewServiceFactory().WithRepository(repo).Finalize()
+	assert.NotNil(t, svc)
+	// When empty env value is passed
+	data, err = svc.IsEnvironmentSupported(context.Background(), """")
+	assert.NotNil(t, data)
+	assert.Nil(t, err)
+	assert.Equal(t, false, data)
+
+	// When correct env value is passed, and environment value in capital letters
+	data, err = svc.IsEnvironmentSupported(context.Background(), ""DEV"")
+	assert.NotNil(t, data)
+	assert.Nil(t, err)
+	assert.Equal(t, true, data)
+
+	// When incorrect env value is passed, with env values in capital letters
+	data, err = svc.IsEnvironmentSupported(context.Background(), ""PRODUCTION"")
+	assert.NotNil(t, data)
+	assert.Nil(t, err)
+	assert.Equal(t, false, data)
+
+	// When correct env value is passed, but env values is passed in small letters
+	data, err = svc.IsEnvironmentSupported(context.Background(), ""dev"")
+	assert.NotNil(t, data)
+	assert.Nil(t, err)
+	assert.Equal(t, true, data)
+
+	// When incorrect env value is passed, with env values passed in small letters
+	data, err = svc.IsEnvironmentSupported(context.Background(), ""production"")
+	assert.NotNil(t, data)
+	assert.Nil(t, err)
+	assert.Equal(t, false, data)
+
+}"
+"func NewService() interfaces.Publisher {
+	return MockPublisher{}
+}","func TestNewService(t *testing.T) {
+	cloudRegions := map[string]interface{}{""azure:azure-eastaisa"": """", ""azure:azure-india-central"": """"}
+	var (
+		svc       interfaces.RegionService
+		repo      interfaces.RegionRepository
+		someError = errors.New(""some error"")
+	)
+	//nil repo
+	svc = NewServiceFactory().Finalize()
+	assert.NotNil(t, svc)
+	//use a mock repository
+	repo = mocks.MockRegionRepository{FetchRegionsFn: func(ctx context.Context) (map[string]interface{}, error) {
+		return cloudRegions, nil
+	}}
+	svc = NewServiceFactory().WithRepository(repo).Finalize()
+	assert.NotNil(t, svc)
+
+	repo = mocks.MockRegionRepository{FetchRegionsFn: func(ctx context.Context) (map[string]interface{}, error) {
+		return nil, someError
+	}}
+	svc = NewServiceFactory().WithRepository(repo).Finalize()
+	assert.NotNil(t, svc)
+
+}"
+"func (svc Servicenow) IsValid() bool {
+	return checkEmptyValues(svc)
+}","func TestIsValid(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    Servicenow
+		expected bool
+	}{
+		{
+			name: ""Valid configuration"",
+			input: Servicenow{
+				Username:         ""test_user"",
+				Password:         ""test_password"",
+				ClientID:         ""client_id"",
+				ClientSecret:     ""client_secret"",
+				Env:              ""test"",
+				Version:          ""1.0"",
+				GrantType:        ""password"",
+				Scope:            ""read"",
+				URL:              ""http://test.com"",
+				Path:             ServiceNowServerPath{Auth: ""testAuthPath"", Incident: ""testIncidentPath"", ChangeRequest: ""testChangePath"", Approval: ""testApprovalPath""},
+				TimeoutInSeconds: 30,
+			},
+			expected: true,
+		},
+		{
+			name: ""Empty Username"",
+			input: Servicenow{
+				Password:         ""test_password"",
+				ClientID:         ""client_id"",
+				ClientSecret:     ""client_secret"",
+				Env:              ""test"",
+				Version:          ""1.0"",
+				GrantType:        ""password"",
+				Scope:            ""read"",
+				URL:              ""http://test.com"",
+				Path:             ServiceNowServerPath{Auth: ""testAuthPath"", Incident: ""testIncidentPath"", ChangeRequest: ""testChangePath"", Approval: ""testApprovalPath""},
+				TimeoutInSeconds: 30,
+			},
+			expected: false,
+		},
+		{
+			name: ""Empty Path values"",
+			input: Servicenow{
+				Username:         ""test_user"",
+				Password:         ""test_password"",
+				ClientID:         ""client_id"",
+				ClientSecret:     ""client_secret"",
+				Env:              ""test"",
+				Version:          ""1.0"",
+				GrantType:        ""password"",
+				Scope:            ""read"",
+				URL:              ""http://test.com"",
+				Path:             ServiceNowServerPath{},
+				TimeoutInSeconds: 30,
+			},
+			expected: false,
+		},
+		{
+			name: ""Zero Timeout"",
+			input: Servicenow{
+				Username:         ""test_user"",
+				Password:         ""test_password"",
+				ClientID:         ""client_id"",
+				ClientSecret:     ""client_secret"",
+				Env:              ""test"",
+				Version:          ""1.0"",
+				GrantType:        ""password"",
+				Scope:            ""read"",
+				URL:              ""http://test.com"",
+				Path:             ServiceNowServerPath{Auth: ""testAuthPath"", Incident: ""testIncidentPath"", ChangeRequest: ""testChangePath"", Approval: ""testApprovalPath""},
+				TimeoutInSeconds: 0,
+			},
+			expected: false,
+		},
+		{
+			name: ""Completely Empty Configuration"",
+			input: Servicenow{},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.input.IsValid(); got != tt.expected {
+				t.Errorf(""Servicenow.IsValid() = %v, expected %v"", got, tt.expected)
+			}
+		})
+	}
+}"
+"func (auth jwtAuthenticator) Authenticate(ctx context.Context, w http.ResponseWriter,
+	r *http.Request, request interface{}) (context.Context, interface{}, error) {
+	token := tokenFromHeader(r)
+	err := errors.New(""unauthorized request"")
+	if len(token) == 0 {
+		return ctx, nil, err
+	}
+	newctx, claims, err := auth.getClaims(ctx, token)
+	if err != nil {
+		return ctx, nil, err
+	}
+	if !auth.verifyClaim(claims) {
+		return ctx, nil, errors.New(""unauthorized"")
+	}
+	return newctx, nil, nil
+}","func TestAuthenticate(t *testing.T) {
+	// Lookup the key by its ID
+	key, ok := mockSet.LookupKeyID(kid)
+	if !ok {
+		t.Fatalf(""key with kid %s not found"", kid)
+	}
+	token, err := jwt.NewBuilder().
+		Issuer(""issuer"").
+		Audience([]string{""audience""}).
+		Expiration(time.Now().Add(time.Hour)).
+		IssuedAt(time.Now()).
+		JwtID(""jwtid"").
+		Subject(""subject"").
+		Build()
+	assert.NoError(t, err)
+
+	signedToken, err := jwt.Sign(token, jwt.WithKey(jwa.HS256, key))
+	assert.NoError(t, err)
+
+	req, _ := http.NewRequest(""GET"", ""/"", nil)
+
+	t.Run(""EmptyToken"", func(t *testing.T) {
+		req.Header.Set(""Authorization"", ""Bearer "")
+
+		// Call the Authenticate method
+		newCtx, _, err := auth.Authenticate(ctx, nil, req, nil)
+		assert.Equal(t, ""unauthorized request"", err.Error())
+		assert.NotNil(t, newCtx)
+	})
+
+	t.Run(""GetClaims InvalidToken"", func(t *testing.T) {
+		auth := jwtAuthenticator{}
+		req.Header.Set(""Authorization"", ""Bearer invalidToken"")
+
+		_, _, err := auth.Authenticate(ctx, nil, req, nil)
+		assert.Error(t, err)
+		assert.Equal(t, ""invalid JWT"", err.Error())
+	})
+
+	t.Run(""VerifyClaim"", func(t *testing.T) {
+		auth.claims[""aud""] = []string{""newAudience""}
+
+		req.Header.Set(""Authorization"", ""Bearer ""+string(signedToken))
+
+		// Call the Authenticate method
+		newCtx, _, err := auth.Authenticate(ctx, nil, req, nil)
+		assert.Error(t, err)
+		assert.Equal(t, ""unauthorized"", err.Error())
+		assert.NotNil(t, newCtx)
+	})
+
+	t.Run(""Success"", func(t *testing.T) {
+		auth.claims[""aud""] = []string{""audience""}
+
+		req.Header.Set(""Authorization"", ""Bearer ""+string(signedToken))
+
+		newCtx, _, err := auth.Authenticate(ctx, nil, req, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, newCtx)
+
+		expectedCtx, _, err := auth.getClaims(ctx, string(signedToken))
+		assert.NoError(t, err)
+		assert.NotNil(t, expectedCtx)
+
+		assert.Equal(t, expectedCtx, newCtx, ""OID in the context should match the expected value"")
+	})
+}"
+"func ExecSampleTG(ctx context.Context, jobID string, payload []byte) (ombentities.Msi, error) {
+	logger.L.DebugCtx(ctx, ""sample exec tg"", zap.Any(""jobID"", jobID))
+	sample := `
+	[
+		{
+			""host_name"": ""azlpgsample-appPRODd605-0"",		
+			""host_ip"": ""10.128.1.56"",
+			""vaultid"": ""/subscriptions/d0c31d08-6490-4e58-b22c-c0f84f6ef4dd/resourceGroups/rg_omnibase_omb_omb-vault_mkv/providers/Microsoft.KeyVault/vaults/omb-vault"",
+			""vaulturi"": ""https://omb-vault.vault.azure.net/"",
+			""vm_group"": """",
+			""secret_name"": ""pg-ssh-key-private-ssh-keyazlpgsample-appPRODd605-0"",
+			""secret_version"": ""cca365acc12c41728bb45ddc73398275""
+		}
+    ]
+	`
+	var outputs []ombentities.HostDetails
+	err := json.Unmarshal([]byte(sample), &outputs)
+	fmt.Println(outputs, ""     "", err)
+	logger.L.InfoCtx(ctx, ""terraform sample outputs"", zap.Any(""outputs"", outputs))
+	return ombentities.Msi{""outputs"": outputs}, nil
+}","func TestExecSampleTG(t *testing.T) {
+	tests := []struct {
+		name      string
+		jobID     string
+		payload   []byte
+		expected  ombentities.Msi
+		expectErr bool
+	}{
+		{
+			name:    ""Successful Execution"",
+			jobID:   ""test-job"",
+			payload: []byte{},
+			expected: ombentities.Msi{
+				""outputs"": []ombentities.HostDetails{
+					{
+						Name:          ""azlpgsample-appPRODd605-0"",
+						IP:            ""10.128.1.56"",
+						Vaultid:       ""/subscriptions/d0c31d08-6490-4e58-b22c-c0f84f6ef4dd/resourceGroups/rg_omnibase_omb_omb-vault_mkv/providers/Microsoft.KeyVault/vaults/omb-vault"",
+						Vaulturi:      ""https://omb-vault.vault.azure.net/"",
+						VMGroup:       """",
+						SecretName:    ""pg-ssh-key-private-ssh-keyazlpgsample-appPRODd605-0"",
+						SecretVersion: ""cca365acc12c41728bb45ddc73398275"",
+					},
+				},
+			},
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger.L = logger.New(zap.NewNop())
+
+			outputs, err := ExecSampleTG(context.Background(), tt.jobID, tt.payload)
+
+			if tt.expectErr {
+				assert.Error(t, err)
+				assert.Equal(t, tt.expected, outputs)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, outputs)
+			}
+		})
+	}
+}"
+"func (m MockJiraSvc) MarkIssueFail(ctx context.Context, issueIdorKey string, comment string) error {
+	if m.MarkIssueFailFn != nil {
+		return m.MarkIssueFailFn(ctx, issueIdorKey, comment)
+	}
+	return nil
+}","func TestMarkIssueFail(t *testing.T) {
+	t.Run(idOrKeyMissingMsg, func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, nil)
+		err := jiraSvc.MarkIssueFail(ctx, """", ""Maersk"")
+		assert.NotNil(t, err)
+		expectedErr := errIssueIdOrKeyMissing
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(clientMissing, func(t *testing.T) {
+		jiraSvc := jiraSvc{client: nil}
+		err := jiraSvc.MarkIssueFail(ctx, issueID121, ""Maersk"")
+		assert.NotNil(t, err)
+		expectedErr := errClientNotInitialized
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(commentAddFailureMsg, func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, &utilStruct)
+		err := jiraSvc.MarkIssueFail(ctx, issueID121, ""Maersk"")
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(clientReqFailureMsg, func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return nil, errors.New(errMessage)
+		}}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.MarkIssueFail(ctx, issueID121, ""Maersk"")
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(clientDoFailureMsg, func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), errors.New(errMessage)
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.MarkIssueFail(ctx, issueID121, ""Maersk"")
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(status204Msg, func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 204}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), nil
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.MarkIssueFail(ctx, issueID121, ""Maersk"")
+		assert.Nil(t, err)
+	})
+	t.Run(statusnot204Msg, func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 502}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), errors.New(errMessage)
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.MarkIssueFail(ctx, issueID121, ""Maersk"")
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+}"
+"func NewMSS(tokenF func() (string, string), cKeyP, secKeyP string, cKeyNP, secKeyNP string) (interfaces.SecretStore, error) {
+	return mss.New(tokenF, cKeyP, secKeyP, cKeyNP, secKeyNP)
+}","func TestNewMSS(t *testing.T) {
+	tokenF := func() (string, string) {
+		return "" "", "" ""
+	}
+	testcKeyP := ""cKeyP""
+	testsecKeyP :=  ""secKeyP""
+	testcKeyNP := ""cKeyNP""
+	testsecKeyNP := ""secKeyNP""
+	secretStore, err := NewMSS(tokenF, testcKeyP, testsecKeyP, testcKeyNP, testsecKeyNP)
+	assert.NotNil(t, secretStore)
+	assert.NoError(t, err)
+}"
+"func (m MockJiraSvc) AddIssueComment(ctx context.Context, issueIdorKey string, comment string) error {
+	if m.AddIssueCommentFn != nil {
+		return m.AddIssueCommentFn(ctx, issueIdorKey, comment)
+	}
+	return nil
+}","func TestAddIssueComment(t *testing.T) {
+	t.Run(idOrKeyMissingMsg, func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, nil)
+		err := jiraSvc.AddIssueComment(ctx, """", ""Maersk"")
+		assert.NotNil(t, err)
+		expectedErr := ""issue ID/Key or comment is missing""
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(""when comment is missing"", func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, nil)
+		err := jiraSvc.AddIssueComment(ctx, ""MNBS-221"", """")
+		assert.NotNil(t, err)
+		expectedErr := ""issue ID/Key or comment is missing""
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(""when comment is missing"", func(t *testing.T) {
+		jiraSvc := jiraSvc{client: nil}
+		err := jiraSvc.AddIssueComment(ctx, ""MNBS-221"", ""Omnbiase DBaaS"")
+		assert.NotNil(t, err)
+		expectedErr := errClientNotInitialized
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(""when svc.generateUrl fails"", func(t *testing.T) {
+		ss := mock.NewMockSecretStore(mock.WithGetSecret(func(ctx context.Context, key string) (string, error) { return ""bghssdyuun"", nil }))
+		jiraSvc, _ := New(ctx, ss, JiraConf, &utilStruct)
+		err := jiraSvc.AddIssueComment(ctx, issueID121, OmbDbaas)
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(clientReqFailureMsg, func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return nil, errors.New(errMessage)
+		}}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.AddIssueComment(ctx, issueID121, OmbDbaas)
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(clientDoFailureMsg, func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), errors.New(errMessage)
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.AddIssueComment(ctx, issueID121, OmbDbaas)
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+	t.Run(""when response code 201"", func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 201}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), nil
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.AddIssueComment(ctx, issueID121, OmbDbaas)
+		assert.Nil(t, err)
+	})
+	t.Run(""when response code is not 201"", func(t *testing.T) {
+		mockHttpClient := mocks.MockHttpClient{NewRequestFn: func(ctx context.Context, method, urlStr string, body []byte, reqHeaders map[string]string) (*http.Request, error) {
+			return &http.Request{}, nil
+		},
+			DoFn: func(req *http.Request) (*http.Response, []byte, error) {
+				return &http.Response{StatusCode: 204}, []byte(`{""field1"": ""value1"", ""field2"": 42}`), errors.New(errMessage)
+			},
+		}
+		getFinalUrlFn := func(baseUrl, path string) (string, error) {
+			return issueCreationURL, nil
+		}
+		jiraSvc := jiraSvc{client: mockHttpClient}
+		jiraSvc.generateUrl = getFinalUrlFn
+		err := jiraSvc.AddIssueComment(ctx, issueID121, OmbDbaas)
+		assert.NotNil(t, err)
+		expectedErr := errMessage
+		assert.EqualError(t, err, expectedErr)
+	})
+}"
+"func UntransformResource(r Resource) provent.Resource {
+	return provent.Resource{
+		ID:               r.ID,
+		TenantID:         r.TenantID,
+		Name:             r.Payload.Name,
+		Orchestrator:     r.Metadata.Orchestrator,
+		Environment:      r.Metadata.Hosting.Environment,
+		EnvironmentClass: r.EnvironmentClass,
+		Source:           r.Source,
+		JIRATicketID:     r.JIRATicketID,
+		Region:           r.Metadata.Hosting.Region.Name,
+		Payload: ombentities.Msi{
+			""name"":                              r.Payload.Name,
+			provent.DatabaseNameKey.String():    r.Payload.DBName,
+			provent.UserNameKey.String():        r.Payload.UserName,
+			provent.ApplicationNameKey.String(): r.Payload.ApplicationName,
+			provent.ApplicationCodeKey.String(): r.Payload.ApplicationCode,
+		},
+	}
+}","func TestUntransformResource(t *testing.T) {
+	input := Resource{
+		ID:               ""1"",
+		TenantID:         ""tenant_123"",
+		EnvironmentClass: ""prod"",
+		Source:           ""source_system"",
+		JIRATicketID:     ""JIRA-456"",
+		Metadata: Metadata{
+			Orchestrator: ""orchestrator_1"",
+			Hosting: Hosting{
+				Environment: ""env_1"",
+				Region: Region{
+					Name: ""region_1"",
+				},
+			},
+		},
+		Payload: Payload{
+			Name:            ""resource_name"",
+			DBName:          ""db_name"",
+			UserName:        provent.UserNameKey.String(),
+			ApplicationName: ""app_name"",
+			ApplicationCode: ""app_code"",
+		},
+	}
+	expected := provent.Resource{
+		ID:               ""1"",
+		TenantID:         ""tenant_123"",
+		Name:             ""resource_name"",
+		Orchestrator:     ""orchestrator_1"",
+		Environment:      ""env_1"",
+		EnvironmentClass: ""prod"",
+		Source:           ""source_system"",
+		JIRATicketID:     ""JIRA-456"",
+		Region:           ""region_1"",
+		Payload: provmsi.Msi{
+			""name"":                              ""resource_name"",
+			provent.DatabaseNameKey.String():    ""db_name"",
+			provent.UserNameKey.String():        ""user_name"",
+			provent.ApplicationNameKey.String(): ""app_name"",
+			provent.ApplicationCodeKey.String(): ""app_code"",
+		},
+	}
+	actual := UntransformResource(input)
+	if !reflect.DeepEqual(actual, expected) {
+		t.Errorf(""UntransformResource() = %v, want %v"", actual, expected)
+	}
+}"
+"func StartDecommissioningCronjob(ctx context.Context, mSvc interfaces.ManagerService, schedule string, done <-chan bool) error {
+	c := cron.New()
+
+	// Define the Cron job schedule
+	if _, err := c.AddFunc(schedule, func() {
+		if err := mSvc.ProcessCompleteDecommissioning(ctx); err != nil {
+			logger.L.ErrorCtx(ctx, ""couldnt complete decommissioning"", zap.Error(err))
+		}
+	}); err != nil {
+		return err
+	}
+
+	// Start the Cron job scheduler
+	c.Start()
+
+	// Stop the Cron job scheduler
+	defer c.Stop()
+
+	for {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}","func TestStartDecommissioningCronjob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan bool)
+	defer close(done)
+
+	t.Run(""Successful execution of cron job"", func(t *testing.T) {
+		mockSvc := mocks.MockManagerService{
+			MockSvcProcessor: mocks.MockSvcProcessor{
+				ProcessCompleteDecommissioningFn: func(ctx context.Context) error {
+					return nil
+				},
+			},
+		}
+		schedule := ""@every 1s""
+
+		go func() {
+			if err := StartDecommissioningCronjob(ctx, mockSvc, schedule, done); err != nil {
+				assert.NoError(t, err)
+			}
+		}()
+
+		time.Sleep(2 * time.Second)
+
+		assert.NotNil(t, mockSvc.ProcessCompleteDecommissioningFn, ""ProcessCompleteDecommissioningFn was not called"")
+	})
+
+	t.Run(""Cron job handles error gracefully"", func(t *testing.T) {
+		mockSvc := mocks.MockManagerService{
+			MockSvcProcessor: mocks.MockSvcProcessor{
+				ProcessCompleteDecommissioningFn: func(ctx context.Context) error {
+					return errors.New(""mock error"") 
+				},
+			},
+		}
+		schedule := ""@every 1s""
+
+		go func() {
+			if err := StartDecommissioningCronjob(ctx, mockSvc, schedule, done); err != nil {
+				assert.NoError(t, err)
+			}
+		}()
+
+		time.Sleep(2 * time.Second)
+
+		assert.NotNil(t, mockSvc.ProcessCompleteDecommissioningFn, ""ProcessCompleteDecommissioningFn was not called"")	
+	})
+
+	t.Run(""Cron job handles context cancellation"", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		mockSvc := &mocks.MockManagerService{
+			MockSvcProcessor: mocks.MockSvcProcessor{
+				ProcessCompleteDecommissioningFn: func(ctx context.Context) error {
+					return nil
+				},
+			},
+		}
+		schedule := ""@every 1s""
+		done := make(chan bool)
+		defer close(done)
+
+		go func() {
+			err := StartDecommissioningCronjob(ctx, mockSvc, schedule, done)
+			assert.NoError(t, err)
+		}()
+
+		time.Sleep(1 * time.Second)
+		cancel()
+		time.Sleep(1 * time.Second)
+	})
+
+	t.Run(""cronjob handles error when AddFunc returns an error"", func(t *testing.T) {
+		ctx := context.Background()
+
+		mockSvc := &mocks.MockManagerService{
+			MockSvcProcessor: mocks.MockSvcProcessor{
+				ProcessCompleteDecommissioningFn: func(ctx context.Context) error {
+					return nil
+				},
+			},
+		}
+		invalidSchedule := ""invalid_schedule""
+		done := make(chan bool)
+		defer close(done)
+
+		err := StartDecommissioningCronjob(ctx, mockSvc, invalidSchedule, done)
+
+		assert.Error(t, err, ""Expected an error due to invalid schedule, but got nil"")
+	})
+}"
